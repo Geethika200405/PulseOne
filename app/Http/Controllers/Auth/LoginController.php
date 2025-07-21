@@ -1,0 +1,136 @@
+<?php
+namespace App\Http\Controllers\Auth;
+
+use App\Http\Controllers\Controller;
+use App\Models\Role;
+use App\Models\User;
+use App\Models\UserRole;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Session;
+
+class LoginController extends Controller
+{
+    // handle login request
+    public function login(Request $request)
+    {
+        $credentials = $request->validate([
+            'email'    => ['required', 'email'],
+            'password' => ['required'],
+        ]);
+
+        if (! Auth::attempt($credentials, $request->filled('remember'))) {
+            return back()->withErrors(['email' => 'Invalid credentials'])->onlyInput('email');
+        }
+
+        $request->session()->regenerate();
+
+        $user      = Auth::user();
+        $roles     = UserRole::where('user_id', $user->id)->pluck('role_id');
+        $roleNames = Role::whereIn('role_id', $roles)->pluck('role_name')->toArray();
+
+        session(['user_roles' => $roleNames]);
+
+        if ($user->mfa_enabled) {
+            $code      = rand(100000, 999999);
+            $expiresAt = now()->addMinutes(3);
+            session([
+                '2fa_code'       => $code,
+                '2fa_expires_at' => $expiresAt,
+            ]);
+
+            Mail::send('emails.2faCode', ['user' => $user, 'code' => $code], function ($message) use ($user) {
+                $message->to($user->email)
+                    ->subject('Your 2FA Verification Code');
+            });
+
+            return redirect()->route('2fa.verify');
+        }
+
+        return $this->handleRoleRedirect($roleNames);
+    }
+
+    // handle 2FA verification
+    public function verify2FA(Request $request)
+    {
+        $request->validate([
+            'code' => ['required', 'digits:6'],
+        ]);
+
+        $code      = session('2fa_code');
+        $expiresAt = session('2fa_expires_at');
+
+        if (now()->greaterThan($expiresAt)) {
+            return back()->withErrors(['code' => 'Verification code has expired.']);
+        }
+
+        if ($request->code != $code) {
+            return back()->withErrors(['code' => 'Invalid verification code.']);
+        }
+
+        $roles = session('user_roles');
+        return $this->handleRoleRedirect($roles);
+    }
+
+    // handle role selection logic
+    protected function handleRoleRedirect(array $roles)
+    {
+        if (count($roles) == 1) {
+            return redirect()->route($roles[0] . '.dashboard');
+        }
+
+        return redirect()->route('selectRole');
+    }
+
+    // handle role selection
+    public function submitSelectedRole(Request $request)
+    {
+        $request->validate([
+            'selected_role' => ['required', 'string'],
+        ]);
+
+        $selectedRole = $request->input('selected_role');
+
+        if (! in_array($selectedRole, session('user_roles'))) {
+            return back()->withErrors(['selected_role' => 'Invalid role selection.']);
+        }
+
+        return redirect()->route($selectedRole . '.dashboard');
+    }
+
+    // resend the 2FA code
+    public function resend2FA(Request $request)
+    {
+        $user = Auth::user();
+
+        if (! $user || ! $user->mfa_enabled) {
+            return redirect()->route('login')->withErrors(['email' => 'Session expired or MFA not enabled.']);
+        }
+
+        $code      = rand(100000, 999999);
+        $expiresAt = now()->addMinutes(3);
+
+        session([
+            '2fa_code'       => $code,
+            '2fa_expires_at' => $expiresAt,
+        ]);
+
+        Mail::send('emails.2faNewCode', ['user' => $user, 'code' => $code], function ($message) use ($user) {
+            $message->to($user->email)
+                ->subject('Your New 2FA Verification Code');
+        });
+
+        return back()->with('status', 'A new verification code has been sent to your email.');
+    }
+
+    // handle logout
+    public function logout(Request $request)
+    {
+        Auth::logout();
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+
+        return redirect()->route('home');
+    }
+}
